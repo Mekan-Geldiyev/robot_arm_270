@@ -1,0 +1,78 @@
+{
+  "_removed": {
+    "ELBOW_BENT_REST": "Removed 2026-08-23 - its raw signature (near-straight elbow, arm hanging back, ~164,-86,0,180) is generic enough that it was absorbing unrelated poses (confirmed: a live 'hand forward low' reading snapped to it at d=0.06). Its own servo value was already an acknowledged compromise (pan/tilt hit a mechanical hard-stop before reaching the true guard position). Don't re-add until that hard-stop is fixed (360-degree servo or reworked mount) and a real guard pose can be captured."
+  },
+  "_disabled_positions_NOTE": "Entries under _disabled_positions (below) are NOT deleted, just excluded from calibration_positions so CalibrationLoader never loads them - JSON has no real comment syntax, this is the equivalent of commenting them out. Data is fully preserved; move an entry back into calibration_positions to re-enable it.",
+  "_disabled_positions": {
+    "HOOK_WINDUP": {
+      "mediapipe": [179, -85, -22, 100],
+      "servo": [0, 90, 145, 0],
+      "note": "First point along an actual hook swing (windup -> mid -> mid -> extension), captured with capture_point.py's mean/std burst tool, real arm level/straight, no angle. A second run of this same pose came back wildly different ([163,-5,0,180]) - traced to the right arm being visible in guard during that run; CROP_RIGHT_FRAC only trims the far right edge of frame, not a raised guard near center, so that run is discarded. Recapture with the right arm fully out of frame if this one ever needs revisiting.",
+      "reason_disabled": "2026-08-25 - live hook mirroring through this + HOOK_MID_1/2/EXTENSION was too unstable (see their notes - real hook elbow angles sit inside YAW_ELBOW_FADE's transition band, amplifying noise). Replaced by hook_detector.py + a scripted animation (hook_animation_test.py) for the yaw/elbow portion specifically - pan/tilt still track live. Re-enable these only if live hook interpolation is revisited."
+    },
+    "HOOK_MID_1": {
+      "mediapipe": [178, 1, -43, 155],
+      "servo": [0, 90, 85, 0],
+      "note": "std on yaw (19.3) and elbow (11.9) flagged high by capture_point.py. Root cause, not just 'hard to hold still': elbow's mean (155) sits inside YAW_ELBOW_FADE_START/END's transition band (170/150) in track.py, so small real elbow fluctuations during the dynamic swing flip the fade multiplier between ~0 and ~1, amplifying elbow noise into much bigger yaw noise. If mid-swing hook frames feel unstable live, this fade band overlapping real hook elbow angles is the first thing to revisit, not the capture technique.",
+      "reason_disabled": "2026-08-25 - see HOOK_WINDUP's reason_disabled."
+    },
+    "HOOK_MID_2": {
+      "mediapipe": [178, 3, -55, 143],
+      "servo": [0, 90, 60, 0],
+      "note": "Same fade-band variance issue as HOOK_MID_1 (yaw std 26.9, elbow std 19.5) - elbow mean 143 is also inside the 150/170 transition band. A second run of this pose ([144,-81,-98,54]) is discarded for the same right-arm-in-guard contamination reason as HOOK_WINDUP.",
+      "reason_disabled": "2026-08-25 - see HOOK_WINDUP's reason_disabled."
+    },
+    "HOOK_EXTENSION": {
+      "mediapipe": [171, -49, -52, 144],
+      "servo": [0, 90, 0, 0],
+      "note": "Servo elbow deliberately set to 0 (fully bent), not the 76 originally found by jogging - a real hook keeps the elbow bent through contact (compact fist, less moment of inertia - see the Hook Calibration writeup), and the first attempt at this pose drifted toward a straighter arm. The raw mediapipe reading (elbow 144, moderately open) still reflects that straighter arm from capture, so this entry intentionally pairs a 'moderately bent' raw signature with a 'fully bent' servo target. Also high variance on capture (yaw std 28.0, elbow std 24.3), same fade-band cause as the MID points. If live hook extension looks like it snaps too abruptly to fully-bent, re-capture this one for real with the elbow actually held fully bent, rather than trusting this override.",
+      "reason_disabled": "2026-08-25 - see HOOK_WINDUP's reason_disabled."
+    },
+    "BOXING_JAB": {
+      "mediapipe": [153, -63, -15, 170],
+      "servo": [0, 90, 0, 90],
+      "note": "Re-recorded twice (first attempt was [150,1,-55,50] - wildly different, especially elbow 50 vs 170, confirming the pose itself is hard for MediaPipe to read stably here). User also flagged this raw reading as suspiciously close to a forward-reaching pose (HAND_FORWARD_LOW/HAND_OUT_CENTER).",
+      "reason_disabled": "2026-08-27 - genuinely redundant, not just noisy: its servo output (0,90,0,90) is IDENTICAL to HAND_OUT_CENTER's, so even a perfectly-captured version would add no new behavior - only a confusable raw signature competing for nearest-neighbor credit. HAND_OUT_CENTER and HAND_LEFT_MIDDLE already cover this region. Re-add only if a jab-specific servo target (distinct from HAND_OUT_CENTER) is ever actually needed."
+    }
+  },
+  "calibration_positions": {
+    "HAND_OUT_CENTER": {
+      "mediapipe": [168, -12, 0, 180],
+      "servo": [0, 90, 0, 90]
+    },
+    "HAND_DOWN": {
+      "mediapipe": [177, -83, -19, 115],
+      "servo": [0, 180, 90, 90],
+      "note": "Elbow raw is 115, not near the ~180 a fully-straight hanging arm should read - recorded twice (106, then 115), both far short of straight. Likely the same small-real-depth-difference weakness in MediaPipe's z as the front/behind-torso ambiguity, not a capture mistake - don't expect this to hit 180 no matter how carefully it's re-recorded."
+    },
+    "HAND_LEFT_UP": {
+      "mediapipe": [128, 21, -61, 155],
+      "servo": [0, 40, 90, 90]
+    },
+    "HAND_LEFT_MIDDLE": {
+      "mediapipe": [115, -1, -55, 139],
+      "servo": [0, 90, 40, 90] 
+    },
+    "HAND_LEFT_DOWN": {
+      "mediapipe": [176, -50, -50, 141],
+      "servo": [40, 90, 90, 90]
+    },
+    "HAND_UP_LEFT_DIAGONAL": {
+      "mediapipe": [146, 37, 0, 122],
+      "servo": [0, 50, 30, 90]
+    },
+    "BOXING_HOOK_SETUP": {
+      "mediapipe": [178, -20, 0, 180],
+      "servo": [0, 90, 130, 0],
+      "note": "Elbow raw is 180 (fully straight) on both recordings, even though this pose is hand-at-ear with the elbow clearly bent - MediaPipe's elbow-plane geometry is unreliable specifically when the wrist is close to the head/shoulder in real 3D space. Treat this entry's elbow raw as low-confidence; the servo side (re-confirmed at 0,90,130,0) is the trustworthy half."
+    },
+    "HAND_FORWARD_LOW": {
+      "mediapipe": [161, -74, -35, 43],
+      "servo": [20, 90, 0, 90]
+    },
+    "HAND_LEFT_EXTENDED": {
+      "mediapipe": [115, -2, -50, 112],
+      "servo": [0, 110, 90, 90]
+    }
+  }
+}
