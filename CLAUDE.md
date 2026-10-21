@@ -183,6 +183,54 @@ that - not a dependency for a working demo. See the README's "Known
 limitations & open questions" section for the fuller, reviewer-facing
 version of this list.
 
+## This repo: the 270-degree rebuild (as of 2026-10-20)
+
+Separate repo/folder from `robot_arm` (180-degree, kept intact as a
+fallback - see that repo's CLAUDE.md for everything above this section,
+which otherwise still applies here too: pan/roll coupling, yaw != palm
+roll, the two control approaches, EFIGHT lineage, etc). New DS3218/Miuzei
+270-degree servos physically installed; `robot_arm_270.ino` is the active
+firmware (0-270 range, not 180). Real centering confirmed on the physical
+build (not assumed): pan=145, tilt=120, yaw=70, elbow=135 - see
+`positions_270.py`'s header for the full direction-per-channel reference.
+`calibration_data.json` was rebuilt by reusing the ORIGINAL raw MediaPipe
+readings (those are about the user's body, unchanged by the servo swap)
+paired with freshly hand-jogged servo values - caught and fixed one real
+bug this way: `HAND_OUT_CENTER` (reaching forward) and the T-pose had been
+silently merged into one entry during the rebuild, which is exactly the
+kind of mistake this pairing approach is prone to if a raw value gets
+reused for the wrong named pose - double check the pose NAME still
+matches the raw reading's actual real-world pose, not just that a raw
+value exists.
+
+`PUNCH_DETECTION_ENABLED` (top of `track_interpolation.py`) is currently
+`False` - pure live mirroring only, hook/voice-cued detection fully
+disabled. Flip it back to `True` to re-enable; nothing else needs
+touching. Added a real hold-time requirement (`HOLD_TIME_SEC=2.0`) on top
+of `SNAP_DISTANCE`/`SNAP_MARGIN` - the same point now has to stay the
+confident nearest match continuously for 2 full seconds before locking,
+not just for one frame, which was causing flicker on jittery readings near
+the snap boundary even while holding still.
+
+**Open issue, not yet root-caused**: moving quickly from `HAND_OUT_SIDE`
+toward `HAND_DOWN` (a 77-degree tilt swing) shows a real lag - the arm
+appears to pause for 2-3 seconds partway through, then catches up to
+`HAND_DOWN` 5-6 seconds after the real motion already happened. Checked
+the IDW blend path with a straight-line simulation between the two points
+and it transitions smoothly (`HAND_OUT_SIDE` -> `HAND_LEFT_DOWN` ->
+`HAND_DOWN`, no flat spot, never gets near `SNAP_DISTANCE`) - so probably
+NOT the interpolation math itself, though real human motion isn't a
+straight line in raw-value space so this isn't fully ruled out. Best
+current guess: the raw-signal OneEuroFilter's lag on a large, fast tilt
+swing specifically (77 degrees is a lot to track smoothly) - this would
+produce exactly this symptom, the output slowly catching up to where the
+arm already was well after the real motion stopped, which looks like a
+freeze-then-jump from the outside even though nothing is literally frozen.
+Next diagnostic step, not yet done: log raw vs. smoothed tilt and the
+chosen nearest-neighbor name every frame during a real `HAND_OUT_SIDE` ->
+`HAND_DOWN` motion, to see directly which stage is actually lagging
+instead of guessing further.
+
 ## Running it
 
 ```

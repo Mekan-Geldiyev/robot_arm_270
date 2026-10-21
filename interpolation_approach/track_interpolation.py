@@ -66,6 +66,33 @@ from punch_classifier import PunchClassifier, LABEL_COLORS  # noqa: E402
 # moved, since the file already existed there before this script did.
 CALIBRATION_DATA_PATH = os.path.join(_PARENT_DIR, "interpolation_implement", "calibration_data.json")
 
+# Flip to True to re-enable hook auto-detection and voice/text-cued
+# punches - False means pure live mirroring only, nothing ever overrides
+# pan/tilt/yaw/elbow away from what the camera sees. Single switch: when
+# False, punch_classifier.update() never even gets called below, so
+# neither the automatic hook path nor the voice-cued path can fire -
+# everything downstream of that (hook_start_time, punch_anim_start_time,
+# the animating/punch_animating blocks) just never triggers, no other
+# code needs touching to turn this back on.
+PUNCH_DETECTION_ENABLED = False
+
+# This build's real servo range - must match ANGLE_MAX in robot_arm_270.ino
+# (270, not the old 180-degree hardware's range). Used both to validate
+# calibration_data.json entries aren't out of range and to clamp live
+# output - a leftover hardcoded 180 here would silently corrupt or reject
+# any value above 180 (e.g. HAND_DOWN's servo tilt=220), which is exactly
+# the kind of bug that looks like "nothing's wrong" until a specific
+# calibration point goes missing or a joint stops reaching its real range.
+SERVO_ANGLE_MAX = 270
+
+# Yaw's real neutral on this build is 70 (down=inward/toward the body=
+# crash risk, up=outward=safe - see positions_270.py's header). This floor
+# is a first-guess placeholder, same conservative value as
+# hook_animation_270.py's untested STRIKE_END_YAW, NOT a confirmed safe
+# limit yet - lower it only after testing each new value standalone, the
+# same process the old hardware's floor went through (40 -> 30 -> 20).
+YAW_SAFE_FLOOR_270 = 30
+
 # How many nearest calibration positions to blend between. 3 matches "2-3
 # nearest positions" from the spec; K automatically shrinks if fewer than
 # this many valid calibration positions exist at all.
@@ -139,6 +166,15 @@ SNAP_DISTANCE = 0.15
 # firing on well-separated points, lower it.
 SNAP_MARGIN = 0.1
 
+# How long the same point must stay the confident (SNAP_DISTANCE +
+# SNAP_MARGIN) nearest match before actually locking to it - see the hold-
+# time comment in InterpolationMapper.interpolate(). Matches the "hold a
+# pose for ~2 seconds" feel asked for after live testing - lower it if
+# locking feels sluggish, but raising SNAP_DISTANCE/SNAP_MARGIN instead is
+# probably the wrong fix for flicker now that this exists (that's the
+# mistake this is specifically replacing).
+HOLD_TIME_SEC = 2.0
+
 # ============================================================
 
 
@@ -175,8 +211,8 @@ class CalibrationLoader:
                 )
                 continue
 
-            if not all(0 <= v <= 180 for v in servo_vec):
-                print(f"WARNING: skipping '{name}' - servo value outside 0-180: {servo_vec}")
+            if not all(0 <= v <= SERVO_ANGLE_MAX for v in servo_vec):
+                print(f"WARNING: skipping '{name}' - servo value outside 0-{SERVO_ANGLE_MAX}: {servo_vec}")
                 continue
 
             self.positions.append((
@@ -209,6 +245,12 @@ class InterpolationMapper:
         self.k = min(k, len(positions))
         self.power = power
 
+        # Which calibration point has been the confident (within
+        # SNAP_DISTANCE + SNAP_MARGIN) nearest match, and since when - see
+        # HOLD_TIME_SEC's use in interpolate() below.
+        self._hold_name = None
+        self._hold_since = None
+
         # Per-channel scale for distance normalization - without this, raw
         # Euclidean distance lets whichever channel happens to span the
         # widest range in degrees dominate "closeness" almost entirely.
@@ -222,8 +264,9 @@ class InterpolationMapper:
         cols = list(zip(*(mp_vec for _, mp_vec, _ in positions))) if positions else []
         self.scale = tuple(max(max(c) - min(c), 1.0) for c in cols) if cols else (1.0,) * 4
 
-    def interpolate(self, query):
-        """query: (pan, tilt, yaw, elbow) raw values.
+    def interpolate(self, query, now):
+        """query: (pan, tilt, yaw, elbow) raw values. now: time.monotonic()
+        timestamp for this frame, used for the hold-time requirement below.
         Returns ((pan, tilt, yaw, elbow) servo floats, [(name, weight, distance), ...])."""
         scored = []
         for name, mp_vec, servo_vec in self.positions:
@@ -258,11 +301,32 @@ class InterpolationMapper:
         else:
             margin_ok = nearest[1][0] - nearest[0][0] >= SNAP_MARGIN
 
-        if nearest[0][0] < SNAP_DISTANCE and margin_ok:
+        confident = nearest[0][0] < SNAP_DISTANCE and margin_ok
+        candidate_name = nearest[0][1] if confident else None
+
+        # Require the SAME point to stay the confident match for
+        # HOLD_TIME_SEC before actually locking to it, not just being
+        # close enough for one frame. Pure distance-based snapping (the
+        # old behavior) re-decides fresh every frame, so a raw reading
+        # jittering right at the SNAP_DISTANCE/SNAP_MARGIN boundary could
+        # flicker in and out of "snapped" even while genuinely holding
+        # still - reported as "not very good" after live testing. This
+        # doesn't change WHAT triggers a snap, only requires it to be
+        # true continuously for a while first.
+        if candidate_name != self._hold_name:
+            self._hold_name = candidate_name
+            self._hold_since = now if confident else None
+
+        if confident and (now - self._hold_since) >= HOLD_TIME_SEC:
             dist, name, servo_vec = nearest[0]
             return servo_vec, [(name, 1.0, dist)]
 
-        weights = [1.0 / (dist ** self.power) for dist, _, _ in nearest]
+        # max(dist, epsilon) guards against a divide-by-zero when a point
+        # is at (or extremely near) zero distance but hasn't been held
+        # long enough yet to actually snap - previously unreachable
+        # because a confident match always returned immediately, before
+        # HOLD_TIME_SEC existed to delay that return.
+        weights = [1.0 / (max(dist, 1e-6) ** self.power) for dist, _, _ in nearest]
         total = sum(weights)
         weights = [w / total for w in weights]
 
@@ -301,18 +365,23 @@ def apply_output_filter(filt, t, value, snapped):
 def apply_safety_limits(servo_vec):
     """Hardware safety clamps that apply no matter which software approach
     computed the numbers - these are facts about the physical build, not
-    about track.py's specific formulas. Currently just the yaw floor (see
-    track.YAW_SAFE_FLOOR) - the hand-glued yaw horn mechanically strains
-    below this value. IDW interpolation already can't produce an output
-    outside any single calibrated servo value's range, but the floor is
-    kept here too as a second, independent guard."""
+    about track.py's specific formulas.
+
+    NOT using track.YAW_SAFE_FLOOR (20) here - that value is specific to
+    the OLD 180-degree hardware's horn mounting/neutral and means nothing
+    on this build, where yaw's real neutral is 70 (see positions_270.py).
+    YAW_SAFE_FLOOR_270 below is a first-guess placeholder matching
+    hook_animation_270.py's conservative, untested strike depth - replace
+    it with a real confirmed floor once that's been tested standalone,
+    the same way the old hardware's floor was only lowered after each
+    value was separately verified safe."""
     pan, tilt, yaw, elbow = servo_vec
-    yaw = max(yaw, track.YAW_SAFE_FLOOR)
+    yaw = max(yaw, YAW_SAFE_FLOOR_270)
     return (
-        track.clamp(pan, 0, 180),
-        track.clamp(tilt, 0, 180),
-        track.clamp(yaw, 0, 180),
-        track.clamp(elbow, 0, 180),
+        track.clamp(pan, 0, SERVO_ANGLE_MAX),
+        track.clamp(tilt, 0, SERVO_ANGLE_MAX),
+        track.clamp(yaw, 0, SERVO_ANGLE_MAX),
+        track.clamp(elbow, 0, SERVO_ANGLE_MAX),
     )
 
 
@@ -497,8 +566,12 @@ def main():
         # Keep feeding the classifier real samples even while an animation
         # is playing (the camera's still watching your real arm) - just
         # don't let a detection START a second animation on top of one
-        # already running.
-        punch_result = punch_classifier.update(shoulder, wrist, other_shoulder, raw_yaw, raw_elbow, frame_time)
+        # already running. See PUNCH_DETECTION_ENABLED above - pure
+        # mirroring mode skips this call entirely.
+        punch_result = (
+            punch_classifier.update(shoulder, wrist, other_shoulder, raw_yaw, raw_elbow, frame_time)
+            if PUNCH_DETECTION_ENABLED else None
+        )
         start_hook_this_frame = False
         start_voice_punch_this_frame = False
         voice_punch_target = None  # (tilt, yaw) captured below if a voice command fires this frame
@@ -539,7 +612,7 @@ def main():
         last_smooth_elbow = smooth_elbow
 
         query = (smooth_pan, smooth_tilt, smooth_yaw, smooth_elbow)
-        servo_vec, used = mapper.interpolate(query)
+        servo_vec, used = mapper.interpolate(query, frame_time)
         pan_f, tilt_f, yaw_f, elbow_f = apply_safety_limits(servo_vec)
 
         if start_hook_this_frame:
