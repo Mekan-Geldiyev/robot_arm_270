@@ -54,27 +54,43 @@ if _PARENT_DIR not in sys.path:
     sys.path.insert(0, _PARENT_DIR)
 
 import track  # noqa: E402  (import after sys.path setup, intentional)
-import hook_animation_test  # noqa: E402
-import punch_angle_test  # noqa: E402
-import voice_punch  # noqa: E402
+import punch_angle_270  # noqa: E402
+import voice_punch_270  # noqa: E402
+import imu_punch_listener  # noqa: E402
+import imu_vision_angle_test  # noqa: E402  (reuses angle_to_tilt/HOOK_FAMILY_TILT_ANCHORS/UPPERCUT_CONFIRM_WINDOW_SEC/VISION_OVERRIDE_MAX_ANGLE_DEG - import only, its own main()/camera/serial code never runs here)
 from punch_classifier import PunchClassifier, LABEL_COLORS  # noqa: E402
+from positions_270 import POSITIONS  # noqa: E402
 
 # ==================== TUNABLE SETTINGS ====================
 
-# calibration_data.json currently lives in interpolation_implement/ (a
+# calibration_data_270.json currently lives in interpolation_implement/ (a
 # sibling folder to this one, not inside it) - pointed here rather than
 # moved, since the file already existed there before this script did.
-CALIBRATION_DATA_PATH = os.path.join(_PARENT_DIR, "interpolation_implement", "calibration_data.json")
+# Named _270 specifically (distinct from calibration_data.json, which
+# track_interpolation.py/track.py still use for the 180-degree hardware)
+# so neither build's calibration data can get silently overwritten by the
+# other now that both live in this one repo.
+CALIBRATION_DATA_PATH = os.path.join(_PARENT_DIR, "interpolation_implement", "calibration_data_270.json")
 
-# Flip to True to re-enable hook auto-detection and voice/text-cued
-# punches - False means pure live mirroring only, nothing ever overrides
-# pan/tilt/yaw/elbow away from what the camera sees. Single switch: when
-# False, punch_classifier.update() never even gets called below, so
-# neither the automatic hook path nor the voice-cued path can fire -
-# everything downstream of that (hook_start_time, punch_anim_start_time,
-# the animating/punch_animating blocks) just never triggers, no other
-# code needs touching to turn this back on.
-PUNCH_DETECTION_ENABLED = False
+# Whether punch detection/recognition is active, which detector (wrist
+# IMU vs vision) gets to trigger it, and whether live mirroring runs at
+# all are now asked at startup (see prompt_startup_config()) instead of
+# being fixed constants here - lets one script cover pure mirroring, pure
+# punch-reaction, or both, without a code edit each session.
+
+# Overrides track.TILT_BETA (0.03) for this build only - NOT changed in
+# track.py itself, since that file is shared with the 180-degree build and
+# this is specifically about a 270-degree symptom (see CLAUDE.md's
+# HAND_OUT_SIDE -> HAND_DOWN lag note). BETA controls how fast filtering
+# loosens up as speed increases - 0.03 is the same value pan/yaw use,
+# untuned for tilt's specific case of a large (77 degree), fast swing.
+# track.ELBOW_BETA was raised to 0.10 for an analogous "needs to react
+# faster" reason (different root cause - noise amplification, not a slow
+# large swing - but the same parameter). First guess, not yet confirmed -
+# watch the true_raw_tilt vs smoothed gap in the per-frame log during a
+# real HAND_OUT_SIDE -> HAND_DOWN motion; tune further from what that
+# actually shows rather than assuming this value is already right.
+TILT_BETA_270 = 0.08
 
 # This build's real servo range - must match ANGLE_MAX in robot_arm_270.ino
 # (270, not the old 180-degree hardware's range). Used both to validate
@@ -168,12 +184,57 @@ SNAP_MARGIN = 0.1
 
 # How long the same point must stay the confident (SNAP_DISTANCE +
 # SNAP_MARGIN) nearest match before actually locking to it - see the hold-
-# time comment in InterpolationMapper.interpolate(). Matches the "hold a
-# pose for ~2 seconds" feel asked for after live testing - lower it if
-# locking feels sluggish, but raising SNAP_DISTANCE/SNAP_MARGIN instead is
+# time comment in InterpolationMapper.interpolate(). Lowered from 2.0
+# (2026-10-31) - felt too sluggish holding HAND_DOWN in real testing
+# (nowhere near locked in after several seconds of holding the pose
+# still). 0.3 is still well above a single frame (ordinary jitter can't
+# accidentally satisfy it) but far more responsive - lower it if locking
+# feels sluggish, but raising SNAP_DISTANCE/SNAP_MARGIN instead is
 # probably the wrong fix for flicker now that this exists (that's the
 # mistake this is specifically replacing).
-HOLD_TIME_SEC = 2.0
+#
+# If a pose STILL never locks in even after this change, that's a
+# different problem this constant can't fix - it means that pose is never
+# becoming the confident nearest match in the first place (a distance/
+# calibration-data issue, not a hold-time one). HAND_DOWN specifically has
+# a known note in calibration_data_270.json: its raw elbow reading (115)
+# doesn't match what a fully-straight hanging arm should read, a
+# MediaPipe z-depth limitation, not something hold-time tuning can fix -
+# watch the per-frame "-> {name}" console output while holding the pose
+# to tell which situation this actually is.
+HOLD_TIME_SEC = 0.3
+
+# Confirmed root cause (2026-11-05) of HAND_DOWN specifically never
+# locking in no matter how low HOLD_TIME_SEC goes: its distance NEVER
+# drops below SNAP_DISTANCE in the first place (the z-depth elbow issue
+# noted above inflates it permanently), so `confident` never becomes
+# True and the HOLD_TIME_SEC timer never even starts - it just blends
+# forever, even while visibly printing as the nearest match frame after
+# frame. This is a SEPARATE, frame-count-based lock that doesn't care
+# about SNAP_DISTANCE at all: if the same point has been the single
+# nearest match for this many consecutive frames, snap to it directly -
+# "printed 3 times in a row -> just go there" was the exact ask. Still
+# gated on SNAP_MARGIN (not bypassed) so this can't fire on the
+# deliberately closely-packed HOOK_* arc points, where a stable-looking
+# nearest match can still be a genuinely ambiguous blend region by
+# design - see SNAP_MARGIN's comment.
+NEAREST_STREAK_FRAMES = 3
+
+# Visual framing guide - an outline circle + crosshair drawn at the frame
+# center every frame (even before a pose is detected), so there's
+# something to line a body part (hip is the suggested one, since that's
+# what the pan/yaw geometry is actually anchored on) up against BEFORE
+# tracking starts, instead of guessing at framing and finding out it was
+# off only after raw readings already look wrong. Purely cosmetic - never
+# read anywhere in the tracking/servo pipeline.
+HIP_GUIDE_RADIUS_PX = 50
+HIP_GUIDE_COLOR = (0, 255, 255)  # yellow (BGR) - distinct from the red/orange/green already used elsewhere
+
+# Vertical position as a fraction of frame height (0=top, 1=bottom), not
+# dead center - user's real hip sits about 2/3 of the way down the frame
+# at normal framing distance, confirmed by live test (2026-11-05), not
+# dead middle like a first guess would assume.
+HIP_GUIDE_Y_FRAC = 2 / 3
 
 # ============================================================
 
@@ -251,6 +312,13 @@ class InterpolationMapper:
         self._hold_name = None
         self._hold_since = None
 
+        # Which point has been the single NEAREST match (regardless of
+        # SNAP_DISTANCE) for how many consecutive frames - see
+        # NEAREST_STREAK_FRAMES above. Separate from _hold_name/_hold_since,
+        # which only start counting once SNAP_DISTANCE is already satisfied.
+        self._nearest_streak_name = None
+        self._nearest_streak_count = 0
+
         # Per-channel scale for distance normalization - without this, raw
         # Euclidean distance lets whichever channel happens to span the
         # widest range in degrees dominate "closeness" almost entirely.
@@ -300,6 +368,26 @@ class InterpolationMapper:
             margin_ok = True
         else:
             margin_ok = nearest[1][0] - nearest[0][0] >= SNAP_MARGIN
+
+        # Streak lock: track how many consecutive frames THIS point has
+        # been the single nearest match, independent of SNAP_DISTANCE -
+        # see NEAREST_STREAK_FRAMES above for why this exists (HAND_DOWN's
+        # distance can stay stuck above SNAP_DISTANCE forever even while
+        # it's consistently, unambiguously the closest thing to the live
+        # reading every single frame). Still requires margin_ok, same as
+        # the distance-based path, so this can't fire on the deliberately
+        # closely-packed HOOK_* arc points on a frame where the "nearest"
+        # pick is genuinely ambiguous rather than a real, stable match.
+        nearest_name = nearest[0][1]
+        if nearest_name == self._nearest_streak_name:
+            self._nearest_streak_count += 1
+        else:
+            self._nearest_streak_name = nearest_name
+            self._nearest_streak_count = 1
+
+        if self._nearest_streak_count >= NEAREST_STREAK_FRAMES and margin_ok:
+            dist, name, servo_vec = nearest[0]
+            return servo_vec, [(name, 1.0, dist)]
 
         confident = nearest[0][0] < SNAP_DISTANCE and margin_ok
         candidate_name = nearest[0][1] if confident else None
@@ -362,6 +450,21 @@ def apply_output_filter(filt, t, value, snapped):
     return filt(t, value)
 
 
+def draw_alignment_guide(frame):
+    """Outline circle + crosshair at the frame's horizontal center, 2/3
+    of the way down (HIP_GUIDE_Y_FRAC) rather than dead middle - stand so
+    your hip sits inside it for consistent framing session to session,
+    same idea as the calibration-pose-repeatability note for the wrist
+    IMU. Recomputed from frame.shape each call rather than hardcoded
+    pixels, since track.CROP_RIGHT_FRAC can change the frame width."""
+    h, w = frame.shape[:2]
+    center = (w // 2, int(h * HIP_GUIDE_Y_FRAC))
+    cv2.circle(frame, center, HIP_GUIDE_RADIUS_PX, HIP_GUIDE_COLOR, 2)
+    tick = 10
+    cv2.line(frame, (center[0] - tick, center[1]), (center[0] + tick, center[1]), HIP_GUIDE_COLOR, 1)
+    cv2.line(frame, (center[0], center[1] - tick), (center[0], center[1] + tick), HIP_GUIDE_COLOR, 1)
+
+
 def apply_safety_limits(servo_vec):
     """Hardware safety clamps that apply no matter which software approach
     computed the numbers - these are facts about the physical build, not
@@ -385,15 +488,95 @@ def apply_safety_limits(servo_vec):
     )
 
 
+def prompt_startup_config():
+    """Asks a few questions at launch instead of requiring code edits each
+    session (the old PUNCH_DETECTION_ENABLED constant, or physically
+    disconnecting the IMU, to change behavior) - lets the same script run
+    as pure mirroring, pure punch-reaction, or both. Punch TYPE routing is
+    no longer a session choice (there used to be an "mpu or vision?"
+    question here) - see the hook-vision/uppercut-IMU split in the main
+    loop below, confirmed by a real paired-agreement test across 55 real
+    throws (imu_vision_agreement_results_2026-11-03.md): vision calls
+    hooks right 87% of the time but uppercuts only 22%; the wrist IMU is
+    the mirror image, 95% on uppercuts and only 30% on hooks. Each type
+    always goes to whichever detector is actually good at it - wearing
+    the brace only controls whether the IMU half is available at all."""
+    def ask_yes_no(question, default_yes=True):
+        suffix = "[Y/n]" if default_yes else "[y/N]"
+        while True:
+            answer = input(f"{question} {suffix}: ").strip().lower()
+            if answer == "":
+                return default_yes
+            if answer in ("y", "yes"):
+                return True
+            if answer in ("n", "no"):
+                return False
+            print("Please answer y or n.")
+
+    print("=== Boxing Robot Arm - Session Setup ===")
+    wearing_brace = ask_yes_no("Are you wearing the wrist brace with the MPU-6050?")
+    mirror_enabled = ask_yes_no("Enable live mirroring (arm follows your real arm)?")
+    punch_enabled = ask_yes_no("Enable punch recognition (arm plays hook/uppercut animations)?")
+
+    # Continuous vision-angle hook reading (2026-11-06) - an alternative to
+    # the fixed PUNCHES["4"] hook target below, built/validated standalone
+    # first in imu_vision_angle_test.py (see that file's own docstring for
+    # the full history) before being offered here as a session choice,
+    # same pattern as every other feature in this file. Off by default -
+    # it's genuinely slower to trigger (the IMU side waits out
+    # UPPERCUT_CONFIRM_WINDOW_SEC before committing, instead of firing
+    # instantly) in exchange for reading the actual angle of an angled/
+    # diagonal hook instead of always snapping to the one fixed position.
+    continuous_angle = False
+    if punch_enabled:
+        continuous_angle = ask_yes_no(
+            "Use continuous vision-angle hook reading instead of the fixed hook "
+            "position? (more accurate on angled/diagonal hooks, slower to trigger)",
+            default_yes=False,
+        )
+        if wearing_brace:
+            mode_note = " (continuous angle)" if continuous_angle else ""
+            print(f"Punch routing: HOOK from vision{mode_note}, UPPERCUT from the wrist IMU.")
+        else:
+            print("No brace - punch routing: vision only (hook AND uppercut - IMU unavailable).")
+
+    print(f"=== wearing_brace={wearing_brace}  mirror={mirror_enabled}  "
+          f"punch={punch_enabled}  continuous_angle={continuous_angle} ===\n")
+    return {
+        "wearing_brace": wearing_brace,
+        "mirror_enabled": mirror_enabled,
+        "punch_enabled": punch_enabled,
+        "continuous_angle": continuous_angle,
+    }
+
+
 def main():
+    config = prompt_startup_config()
+
     loader = CalibrationLoader(CALIBRATION_DATA_PATH)
     mapper = InterpolationMapper(loader.positions)
 
     ser = None
     try:
         ser = serial.Serial(track.SERIAL_PORT, track.BAUD_RATE, timeout=1, write_timeout=1)
-        time.sleep(2)  # give the Arduino time to reset after the port opens
-        print(f"Connected to Arduino on {track.SERIAL_PORT}")
+        print(f"Connected to Arduino on {track.SERIAL_PORT} - waiting for it to finish booting...")
+        # robot_arm_270.ino now blocks for ~4s doing wrist-IMU calibration
+        # before it ever reaches loop() (see that file's header) - a blind
+        # sleep(2) isn't long enough anymore and commands sent too early
+        # would just be dropped before the Arduino is reading them. Wait
+        # for its own "imu calibrated" readiness line instead, bounded so
+        # this doesn't hang forever if a different/older sketch is loaded.
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline:
+            line = ser.readline().decode(errors="replace").strip()
+            if "imu calibrated" in line:
+                print(f"Arduino ready: {line}")
+                ready = True
+                break
+        if not ready:
+            print("WARNING: did not see 'imu calibrated' within 10s - continuing anyway "
+                  "(a different/older sketch may be loaded, or the wrist wasn't held still).")
     except serial.SerialException as e:
         print(f"WARNING: could not open {track.SERIAL_PORT} ({e})")
         print("Continuing without serial - tracking/display only.")
@@ -426,7 +609,7 @@ def main():
     last_send_time = 0.0
 
     pan_filter = track.OneEuroFilter(track.PAN_MIN_CUTOFF, track.PAN_BETA, track.D_CUTOFF)
-    tilt_filter = track.OneEuroFilter(track.TILT_MIN_CUTOFF, track.TILT_BETA, track.D_CUTOFF)
+    tilt_filter = track.OneEuroFilter(track.TILT_MIN_CUTOFF, TILT_BETA_270, track.D_CUTOFF)  # see TILT_BETA_270 above
     yaw_filter = track.OneEuroFilter(track.YAW_MIN_CUTOFF, track.YAW_BETA, track.D_CUTOFF)
     elbow_filter = track.OneEuroFilter(track.ELBOW_MIN_CUTOFF, track.ELBOW_BETA, track.D_CUTOFF)
 
@@ -444,40 +627,60 @@ def main():
     start_time = time.monotonic()
 
     # Punch classification (hook / uppercut / unclassified punch) - see
-    # punch_classifier.py. Two SEPARATE animation paths exist, and only one
-    # runs on any given frame:
-    #   - Automatic (no voice command pending): only "hook" triggers
-    #     hook_animation_test.py, exactly as before voice was added - yaw
-    #     /elbow scripted, pan/tilt stay live. This path is untouched by
-    #     the voice integration below on purpose (it's already tuned/
-    #     verified - see the double-dip fix history in CLAUDE.md).
-    #   - Voice-cued (see voice_punch.py): ANY of the 4 named punches
-    #     (punch_angle_test.PUNCH_TILTS - Uppercut/High Overhand/Overhand/
-    #     Hook) gets the fuller punch_angle_test.py animation instead -
-    #     tilt/yaw/elbow all scripted, only pan stays live. This includes
-    #     voice-cued "hook", which now also drives tilt to 90 explicitly
-    #     rather than leaving it live like the automatic path does - hook
-    #     is formally part of this family now, so it gets the family's
-    #     full treatment when you name it, not the older partial one.
+    # punch_classifier.py. ONE animation path now (unlike the 180-degree
+    # build, which kept automatic-hook and voice-cued as two separate
+    # mechanisms) - every trigger, voice or automatic, plays the same full
+    # punch_angle_270.punch_animation_frame() (pan/tilt/yaw/elbow fully
+    # scripted, except pan is deliberately discarded below and kept live -
+    # see the comment where it's applied). Priority each time a strike is
+    # detected:
+    #   1. A pending voice/text-logged tilt (voice_punch_270.py) - wins if
+    #      present, maps to whichever of the 4 PUNCHES it snapped to.
+    #   2. No pending tilt: fall back to the classifier's own geometric
+    #      guess - "hook" plays PUNCHES["4"] (Hook), "uppercut" plays
+    #      PUNCHES["1"] (Uppercut). Unclassified "punch" does nothing
+    #      special, same as before.
     punch_classifier = PunchClassifier()
-    hook_start_time = None
-    hook_start_yaw = None  # yaw's ACTUAL value at the moment a hook was auto-detected -
-                            # the strike animates from here, not a fixed guard pose
 
     punch_anim_start_time = None
-    punch_anim_start_tilt = None
-    punch_anim_start_yaw = None
-    punch_anim_target_tilt = None
-    punch_anim_target_yaw = None
+    punch_anim_start_pos = None   # (pan, tilt, yaw, elbow) - wherever live tracking
+                                   # actually was the instant the strike was detected,
+                                   # NOT a fixed/hardcoded start - forcing a fixed start
+                                   # here was tried and reverted on the 180-degree build
+                                   # (the "cocks back to load the hook" bug, see
+                                   # hook_animation_test.py's STRIKE_START_YAW history) -
+                                   # don't reintroduce that mistake.
+    punch_anim_target_pos = None  # (pan, tilt, yaw, elbow) - the resolved punch's full position
+    punch_anim_pan_swing = 0.0    # degrees - PAN_SWING_BY_KEY.get(key, 0.0), 0 for everything but Uppercut
+    punch_anim_hold_ms = punch_angle_270.HOLD_DURATION_MS  # HOLD_DURATION_BY_KEY.get(key, default), longer for Uppercut
 
-    # Voice-cued punch selection (see voice_punch.py + CLAUDE.md's "Current
-    # direction") - name the punch before throwing instead of guessing
-    # type from ambiguous vision. Runs in its own thread; only consumed
-    # (pop_next_punch()) right when punch_classifier's speed/travel gate
-    # actually fires below, never every frame, so an unrelated later
-    # motion can't accidentally consume a stale voice command.
-    voice_listener = voice_punch.create_listener()  # voice_punch.INPUT_MODE picks voice vs. typed
+    # continuous_angle mode only - an armed-but-not-yet-committed IMU
+    # uppercut call, {"t": frame_time}; see imu_vision_angle_test.py's
+    # UPPERCUT_CONFIRM_WINDOW_SEC/VISION_OVERRIDE_MAX_ANGLE_DEG comments.
+    imu_uppercut_pending = None
+
+    # Voice/text-cued tilt selection (voice_punch_270.py) - say/type a
+    # number before throwing instead of relying on the classifier's guess.
+    # Runs in its own thread; only consumed (pop_next_tilt()) right when
+    # punch_classifier's speed/travel gate actually fires below, never
+    # every frame, so an unrelated later motion can't accidentally consume
+    # a stale logged tilt.
+    voice_listener = voice_punch_270.create_listener()  # voice_punch_270.INPUT_MODE picks voice vs. typed
     voice_listener.start()
+
+    # Wrist IMU punch trigger (imu_punch_listener.py) - reads off the SAME
+    # serial connection as the servo commands above (the IMU logic now
+    # lives inside robot_arm_270.ino itself, not a second Arduino). Unlike
+    # voice, this can fire a punch animation ON ITS OWN, without waiting
+    # for the vision gate - see the trigger-priority block below and that
+    # module's own docstring for why (speed is the entire point of this
+    # sensor).
+    imu_listener = (
+        imu_punch_listener.IMUPunchListener(ser)
+        if (ser and config["wearing_brace"]) else None
+    )
+    if imu_listener:
+        imu_listener.start()
 
     punch_flash_label = ""
     punch_flash_until = 0.0
@@ -498,6 +701,11 @@ def main():
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         timestamp_ms = int((frame_time - start_time) * 1000)
         results = landmarker.detect_for_video(mp_image, timestamp_ms)
+        # Drawn AFTER the detector already consumed `rgb` - this is a
+        # display-only overlay and must never end up in what MediaPipe
+        # actually sees, or the guide circle itself could skew pose
+        # detection right in the one spot the user is told to stand in.
+        draw_alignment_guide(frame)
 
         if not results.pose_landmarks:
             cv2.putText(frame, "No pose detected", (10, 30),
@@ -566,43 +774,163 @@ def main():
         # Keep feeding the classifier real samples even while an animation
         # is playing (the camera's still watching your real arm) - just
         # don't let a detection START a second animation on top of one
-        # already running. See PUNCH_DETECTION_ENABLED above - pure
-        # mirroring mode skips this call entirely.
+        # already running. Both detectors keep running/updating their own
+        # internal state regardless of which one actually gets to trigger
+        # below (preserves cooldown/history continuity either way).
         punch_result = (
             punch_classifier.update(shoulder, wrist, other_shoulder, raw_yaw, raw_elbow, frame_time)
-            if PUNCH_DETECTION_ENABLED else None
+            if config["punch_enabled"] else None
         )
-        start_hook_this_frame = False
-        start_voice_punch_this_frame = False
-        voice_punch_target = None  # (tilt, yaw) captured below if a voice command fires this frame
-        if punch_result:
-            # A strike happened (the gate above already confirmed that) -
-            # if a voice command is pending, trust its declared punch over
-            # the classifier's own geometric guess instead of just
-            # displaying both. Only consumed here, not every frame, so an
-            # unrelated later motion can't burn a stale command (see
-            # PENDING_EXPIRY_SEC in voice_punch.py).
-            voice_punch_cmd = voice_listener.pop_next_punch()
-            effective_type = voice_punch_cmd["type"] if voice_punch_cmd else punch_result["type"]
+        imu_punch_cmd = (
+            imu_listener.pop_next_punch()
+            if (imu_listener and config["punch_enabled"]) else None
+        )
+        start_punch_this_frame = False
+        punch_target_pos = None  # (pan, tilt, yaw, elbow) resolved below if a punch fires this frame
+        punch_target_pan_swing = 0.0
+        punch_target_hold_ms = punch_angle_270.HOLD_DURATION_MS
 
-            punch_flash_label = effective_type.upper()
+        if config["continuous_angle"]:
+            # --- Continuous vision-angle hook reading (optional,
+            # slower-to-trigger alternative to the fixed-position split
+            # below) - same arbitration rule as imu_vision_angle_test.py,
+            # reused via that import rather than re-implemented here, so
+            # tuning one tunes both. Vision drives hook with a CONTINUOUS
+            # tilt computed from the measured angle instead of always
+            # snapping to PUNCHES["4"]'s fixed position; IMU stays the
+            # ONLY uppercut source, but its call arms a short confirm
+            # window (UPPERCUT_CONFIRM_WINDOW_SEC) instead of firing
+            # instantly, giving vision a brief chance to correct an IMU
+            # hook-misread-as-uppercut (~30% accurate there) before it
+            # commits. Only a CONFIDENTLY hook-shaped vision reading
+            # (angle_deg <= VISION_OVERRIDE_MAX_ANGLE_DEG) can actually
+            # override a pending IMU call, though - real uppercuts
+            # (especially diagonal ones) can land inside the full
+            # hook-family range too, and letting any in-range reading
+            # override was tried first and stole real uppercuts.
+            angle_deg = (
+                math.degrees(math.atan2(-punch_result["dy"], punch_result["dx"]))
+                if punch_result else None
+            )
+
+            if imu_punch_cmd and imu_punch_cmd["type"] in ("uppercut", "punch") and punch_anim_start_time is None:
+                imu_uppercut_pending = {"t": frame_time}
+
+            if punch_result and angle_deg is not None and punch_anim_start_time is None:
+                tilt = imu_vision_angle_test.angle_to_tilt(angle_deg)
+                if tilt is not None:
+                    can_trigger = (
+                        imu_uppercut_pending is None
+                        or angle_deg <= imu_vision_angle_test.VISION_OVERRIDE_MAX_ANGLE_DEG
+                    )
+                    if can_trigger:
+                        hook_pan, _, hook_yaw, hook_elbow = POSITIONS["HOOK"]
+                        punch_flash_label = "HOOK"
+                        punch_flash_until = frame_time + 1.0
+                        print(f"\n>>> HOOK (vision angle={angle_deg:+.1f} deg -> tilt={tilt:.0f})")
+
+                        start_punch_this_frame = True
+                        punch_target_pos = (hook_pan, tilt, hook_yaw, hook_elbow)
+                        punch_target_pan_swing = 0.0
+                        punch_target_hold_ms = punch_angle_270.HOLD_DURATION_MS
+                        imu_uppercut_pending = None
+
+            if (punch_anim_start_time is None and imu_uppercut_pending is not None
+                    and frame_time - imu_uppercut_pending["t"] >= imu_vision_angle_test.UPPERCUT_CONFIRM_WINDOW_SEC):
+                effective_label, resolved_target = punch_angle_270.PUNCHES["1"]
+                punch_flash_label = f"IMU {effective_label}".upper()
+                punch_flash_until = frame_time + 1.0
+                print(f"\n>>> {punch_flash_label} (confirmed)")
+
+                start_punch_this_frame = True
+                punch_target_pos = resolved_target
+                punch_target_pan_swing = punch_angle_270.PAN_SWING_BY_KEY.get("1", 0.0)
+                punch_target_hold_ms = punch_angle_270.HOLD_DURATION_BY_KEY.get("1", punch_angle_270.HOLD_DURATION_MS)
+                imu_uppercut_pending = None
+
+        # Hook-vision / uppercut-IMU split (fixed positions, default
+        # mode), confirmed by a real paired agreement test across 55 real
+        # throws (imu_vision_agreement_results_2026-11-03.md): vision
+        # calls hooks right 87% of the time but uppercuts only 22% (it
+        # mostly reads a real uppercut as "hook" or an unclassified
+        # "punch"); the wrist IMU is the mirror image - 95% on uppercuts,
+        # only 30% on hooks. So each type is ALWAYS routed to whichever
+        # detector is actually good at it, instead of picking one source
+        # for the whole session the way this used to work. A naive "both
+        # must agree" rule was tried on the same data and scored WORSE
+        # than either signal alone - don't reintroduce that.
+        elif imu_punch_cmd and imu_punch_cmd["type"] in ("uppercut", "punch") and punch_anim_start_time is None:
+            # Wrist IMU called uppercut (or the low-rotation "punch"
+            # fallback - same PUNCHES["1"] target either way, matching
+            # imu_punch_listener.TYPE_TO_KEY). Takes priority and can
+            # start an animation ON ITS OWN, without waiting for
+            # punch_classifier's speed/travel gate to also agree - the
+            # whole point of the IMU chapter (see
+            # imu_punch_listener.py's docstring). An IMU "hook" call is
+            # deliberately NOT trusted here (only 30% accuracy) - it
+            # falls through and lets vision handle that frame instead.
+            resolved_key = imu_punch_cmd["key"]
+            effective_label, resolved_target = punch_angle_270.PUNCHES[resolved_key]
+            resolved_pan_swing = punch_angle_270.PAN_SWING_BY_KEY.get(resolved_key, 0.0)
+            resolved_hold_ms = punch_angle_270.HOLD_DURATION_BY_KEY.get(resolved_key, punch_angle_270.HOLD_DURATION_MS)
+
+            punch_flash_label = f"IMU {effective_label or imu_punch_cmd['type']}".upper()
+            punch_flash_until = frame_time + 1.0
+            print(f"\n>>> {punch_flash_label} (from wrist IMU)")
+
+            start_punch_this_frame = True
+            punch_target_pos = resolved_target
+            punch_target_pan_swing = resolved_pan_swing
+            punch_target_hold_ms = resolved_hold_ms
+        elif punch_result and (punch_result["type"] == "hook" or not config["wearing_brace"]):
+            # Vision fired. Trusted outright when it specifically calls
+            # "hook" (87% accuracy - what vision is actually good at).
+            # When it instead calls "uppercut"/unclassified "punch", that
+            # fallback is only trusted if there's no wrist IMU this
+            # session (no brace) - with the brace on, the IMU branch
+            # above already owns that type, and vision's 22%-accurate
+            # uppercut guess is deliberately ignored here rather than
+            # risking a wrong animation or a double-trigger race against
+            # the IMU. A pending voice/text tilt still wins over either,
+            # consumed only here (not every frame) so an unrelated later
+            # motion can't burn a stale logged tilt (see
+            # PENDING_EXPIRY_SEC in voice_punch_270.py).
+            voice_tilt_cmd = voice_listener.pop_next_tilt()
+            if voice_tilt_cmd:
+                resolved_key = voice_tilt_cmd["key"]
+            elif punch_result["type"] == "hook":
+                resolved_key = "4"
+            else:
+                # No-brace fallback only (see the elif condition above) -
+                # punch_classifier.py can't tell a jab apart from an
+                # uppercut (both read as a fast, roughly-vertical motion
+                # with no strong yaw signal - a real geometric ambiguity,
+                # same category as the wide-hook-vs-reach limit documented
+                # for the 180-degree build), and there's no jab animation
+                # yet, so anything that's not a hook defaults to Uppercut.
+                resolved_key = "1"
+            effective_label, resolved_target = punch_angle_270.PUNCHES[resolved_key]
+            # PAN_SWING_BY_KEY is Uppercut-only (confirmed in
+            # punch_angle_270.py's own standalone test before being wired
+            # here) - every other key is 0, meaning pan keeps getting
+            # discarded/kept live below exactly as before.
+            resolved_pan_swing = punch_angle_270.PAN_SWING_BY_KEY.get(resolved_key, 0.0)
+            resolved_hold_ms = punch_angle_270.HOLD_DURATION_BY_KEY.get(resolved_key, punch_angle_270.HOLD_DURATION_MS)
+
+            punch_flash_label = (effective_label or punch_result["type"]).upper()
             punch_flash_until = frame_time + 1.0
             yaw_str = f"{punch_result['yaw']:.1f}" if punch_result["yaw"] is not None else "n/a"
             print(f"\n>>> {punch_flash_label} (speed={punch_result['speed']:.2f} "
                   f"travel={punch_result['travel']:.2f} yaw={yaw_str})")
 
-            if voice_punch_cmd and punch_anim_start_time is None:
-                # Any of the 4 named punches now has a real tilt+yaw target
-                # (punch_angle_test.PUNCH_TILTS), so all 4 get the fuller
-                # animation - not just hook like before. Don't grab
-                # start_tilt/start_yaw here - this frame's live tilt_f/
-                # yaw_f haven't been computed yet (that happens below).
-                start_voice_punch_this_frame = True
-                voice_punch_target = (voice_punch_cmd["tilt"], voice_punch_cmd["yaw"])
-            elif effective_type == "hook" and hook_start_time is None:
-                # No voice command pending - fall back to the original
-                # automatic detection path exactly as before.
-                start_hook_this_frame = True
+            if punch_anim_start_time is None:
+                # Don't grab the live start position here - this frame's
+                # pan_f/tilt_f/yaw_f/elbow_f haven't been computed yet
+                # (that happens below). Just flag it.
+                start_punch_this_frame = True
+                punch_target_pos = resolved_target
+                punch_target_pan_swing = resolved_pan_swing
+                punch_target_hold_ms = resolved_hold_ms
 
         smooth_pan = pan_filter(frame_time, raw_pan)
         smooth_tilt = tilt_filter(frame_time, raw_tilt)
@@ -615,64 +943,43 @@ def main():
         servo_vec, used = mapper.interpolate(query, frame_time)
         pan_f, tilt_f, yaw_f, elbow_f = apply_safety_limits(servo_vec)
 
-        if start_hook_this_frame:
-            hook_start_time = frame_time
-            hook_start_yaw = yaw_f  # wherever live tracking actually has yaw right now
-            print(">>> Playing hook animation (auto-detected), pan/tilt still live\n")
-
-        if start_voice_punch_this_frame:
+        if start_punch_this_frame:
             punch_anim_start_time = frame_time
-            punch_anim_start_tilt = tilt_f
-            punch_anim_start_yaw = yaw_f
-            punch_anim_target_tilt, punch_anim_target_yaw = voice_punch_target
-            print(f">>> Playing {punch_flash_label} animation (voice-cued), pan still live\n")
+            punch_anim_start_pos = (pan_f, tilt_f, yaw_f, elbow_f)  # real live values, not a fixed start
+            punch_anim_target_pos = punch_target_pos
+            punch_anim_pan_swing = punch_target_pan_swing
+            punch_anim_hold_ms = punch_target_hold_ms
+            print(f">>> Playing {punch_flash_label} animation, "
+                  f"{'pan swings too' if punch_anim_pan_swing else 'pan still live'}\n")
 
-        # Automatic path: yaw/elbow come from the scripted curve instead of
-        # live interpolation - pan/tilt (already computed above from live
-        # tracking) are untouched either way. This is the hybrid: the two
-        # channels proven unstable during a real hook get a verified
-        # animation, everything else keeps mirroring you live.
-        animating = hook_start_time is not None
-        if animating:
-            elapsed_ms = (frame_time - hook_start_time) * 1000.0
-            anim_yaw, anim_elbow, finished = hook_animation_test.hook_animation_frame(
-                elapsed_ms, start_yaw=hook_start_yaw
-            )
-            _, _, yaw_f, elbow_f = apply_safety_limits((pan_f, tilt_f, anim_yaw, anim_elbow))
-            if finished:
-                hook_start_time = None
-                animating = False
-                # Restart the classifier's cooldown from NOW, not from the
-                # original detection instant. Otherwise, for animations
-                # that take longer than HOOK_COOLDOWN_SEC to play out
-                # (starting far from the target - e.g. near guard, ~400ms
-                # total vs a 350ms cooldown), the cooldown expires before
-                # the animation even finishes. Your real arm is almost
-                # always still snapping back fast at that exact moment,
-                # which looks like a second hook to the classifier (same
-                # shape, reversed direction - it doesn't check sign) -
-                # that's the "double dip" / short second hook. Re-arming
-                # here gives a full fresh cooldown for the retraction to
-                # settle before anything can fire again.
-                punch_classifier.last_punch_at = frame_time
-                print(">>> Hook animation complete - resuming live yaw/elbow tracking")
-
-        # Voice-cued path: tilt/yaw/elbow all come from the scripted curve
-        # (punch_angle_test.punch_animation_frame - reposition tilt, then
-        # strike) - only pan stays live. Same cooldown re-arming as the
-        # automatic path above, for the same double-dip reason.
+        # tilt/yaw/elbow always come from the scripted curve
+        # (punch_angle_270.punch_animation_frame - reposition, then
+        # strike). pan only comes from it too when punch_anim_pan_swing is
+        # non-zero (Uppercut, confirmed good in punch_angle_270.py's own
+        # standalone test before being wired here) - for every other
+        # punch the animated pan is discarded and pan_f (already computed
+        # above from live tracking) is kept instead, same as before this
+        # existed. Same cooldown re-arming as the 180-degree build, for
+        # the same double-dip reason (see that build's CLAUDE.md).
         punch_animating = punch_anim_start_time is not None
         if punch_animating:
             elapsed_ms = (frame_time - punch_anim_start_time) * 1000.0
-            anim_tilt, anim_yaw, anim_elbow, finished = punch_angle_test.punch_animation_frame(
-                elapsed_ms,
-                start_tilt=punch_anim_start_tilt, target_tilt=punch_anim_target_tilt,
-                start_yaw=punch_anim_start_yaw, target_yaw=punch_anim_target_yaw,
+            anim_pan, anim_tilt, anim_yaw, anim_elbow, finished = punch_angle_270.punch_animation_frame(
+                elapsed_ms, start_pos=punch_anim_start_pos, target_pos=punch_anim_target_pos,
+                pan_swing_deg=punch_anim_pan_swing, hold_duration_ms=punch_anim_hold_ms,
             )
-            pan_f, tilt_f, yaw_f, elbow_f = apply_safety_limits((pan_f, anim_tilt, anim_yaw, anim_elbow))
+            used_pan = anim_pan if punch_anim_pan_swing else pan_f
+            pan_f, tilt_f, yaw_f, elbow_f = apply_safety_limits((used_pan, anim_tilt, anim_yaw, anim_elbow))
             if finished:
                 punch_anim_start_time = None
                 punch_animating = False
+                punch_anim_pan_swing = 0.0
+                punch_anim_hold_ms = punch_angle_270.HOLD_DURATION_MS
+                # Restart the classifier's cooldown from NOW, not from the
+                # original detection instant - otherwise a real arm
+                # retraction right after the animation (which often
+                # outlasts the cooldown) reads as a second punch. Same
+                # "double-dip" fix as the 180-degree build.
                 punch_classifier.last_punch_at = frame_time
                 print(">>> Punch animation complete - resuming live tracking")
 
@@ -681,16 +988,19 @@ def main():
         # set changes, which raw-signal smoothing alone can't reach. BUT
         # skip it when snapped (len(used)==1, see SNAP_DISTANCE) - that
         # value is already a confident, verified calibration match, not
-        # noise to smooth away - and skip it on any channel a scripted
-        # curve currently owns, for the same reason: it isn't noise either,
-        # and smoothing it would just add lag on top of carefully-tuned
-        # timing (see apply_output_filter()). tilt is only ever scripted by
-        # the voice-cued path - the automatic path always leaves it live.
+        # noise to smooth away - and skip it on tilt/yaw/elbow while the
+        # punch animation owns them, for the same reason: it isn't noise
+        # either, and smoothing it would just add lag on top of carefully-
+        # tuned timing (see apply_output_filter()). pan only needs the
+        # same bypass while it's ACTUALLY being scripted (Uppercut's swing
+        # - punch_anim_pan_swing nonzero) - for every other punch pan stays
+        # live and gets normal smoothing like any other live motion.
         snapped = len(used) == 1
-        pan_f = apply_output_filter(out_pan_filter, frame_time, pan_f, snapped)
+        pan_scripted = punch_animating and bool(punch_anim_pan_swing)
+        pan_f = apply_output_filter(out_pan_filter, frame_time, pan_f, snapped or pan_scripted)
         tilt_f = apply_output_filter(out_tilt_filter, frame_time, tilt_f, snapped or punch_animating)
-        yaw_f = apply_output_filter(out_yaw_filter, frame_time, yaw_f, snapped or animating or punch_animating)
-        elbow_f = apply_output_filter(out_elbow_filter, frame_time, elbow_f, snapped or animating or punch_animating)
+        yaw_f = apply_output_filter(out_yaw_filter, frame_time, yaw_f, snapped or punch_animating)
+        elbow_f = apply_output_filter(out_elbow_filter, frame_time, elbow_f, snapped or punch_animating)
 
         pan, tilt, yaw, elbow_out = int(pan_f), int(tilt_f), int(yaw_f), int(elbow_f)
 
@@ -699,8 +1009,17 @@ def main():
         nearest_dist = used[0][2] if used else float("inf")
         low_confidence = nearest_dist > LOW_CONFIDENCE_DISTANCE
         confidence_flag = " [LOW CONFIDENCE - no nearby calibration point]" if low_confidence else ""
+        # NOTE: the old "raw=" label here was wrong - those were already
+        # SMOOTHED (post-filter) values, not the true raw MediaPipe
+        # reading, which made it impossible to tell filter lag apart from
+        # anything else just by reading this line. raw_tilt (true,
+        # pre-filter) is added specifically to diagnose the HAND_OUT_SIDE
+        # -> HAND_DOWN lag (see CLAUDE.md) - if raw_tilt swings fast but
+        # smooth_tilt trails far behind it for a couple seconds, that's
+        # the OneEuroFilter lagging, not the interpolation/blend stage.
         print(
-            f"[side {side_label}] raw=[{smooth_pan:6.1f},{smooth_tilt:6.1f},{smooth_yaw:6.1f},{smooth_elbow:6.1f}] "
+            f"[side {side_label}] true_raw_tilt={raw_tilt:6.1f}  "
+            f"smoothed=[{smooth_pan:6.1f},{smooth_tilt:6.1f},{smooth_yaw:6.1f},{smooth_elbow:6.1f}] "
             f"-> {neighbors_str} -> servo: pan={pan:3d} tilt={tilt:3d} yaw={yaw:3d} elbow={elbow_out:3d}{confidence_flag}"
         )
 
@@ -710,7 +1029,14 @@ def main():
         send_vals = {ch: current[ch] if changed[ch] else last_sent[ch] for ch in current}
 
         time_ok = (frame_time - last_send_time) * 1000 >= track.SEND_INTERVAL_MS
-        if ser and time_ok and any(changed.values()):
+        # When mirroring is off (config["mirror_enabled"]==False), only a
+        # punch animation is allowed to move the arm - continuous live-
+        # tracking values are computed above regardless (cheap, and
+        # vision-based punch detection needs them anyway) but never SENT
+        # unless an animation is actually playing, so the arm just holds
+        # still between punches instead of also following your real arm.
+        mirror_ok = config["mirror_enabled"] or punch_animating
+        if ser and time_ok and any(changed.values()) and mirror_ok:
             line = f"{send_vals['pan']},{send_vals['tilt']},{send_vals['yaw']},{send_vals['elbow']}\n"
             try:
                 ser.write(line.encode())
@@ -730,9 +1056,9 @@ def main():
                 frame, "LOW CONFIDENCE - no nearby calibration point", (10, 55),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2,
             )
-        if animating:
+        if punch_animating:
             cv2.putText(
-                frame, "HOOK ANIMATION PLAYING (yaw/elbow scripted)", (10, 80),
+                frame, "PUNCH ANIMATION PLAYING (tilt/yaw/elbow scripted)", (10, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
             )
 
@@ -761,6 +1087,8 @@ def main():
             break
 
     voice_listener.stop()
+    if imu_listener:
+        imu_listener.stop()
     cap.release()
     cv2.destroyAllWindows()
     landmarker.close()
